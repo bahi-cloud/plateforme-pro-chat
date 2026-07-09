@@ -335,6 +335,14 @@ let sessions=[],curId=null,tools=[],files=[],busy=false,abortCtl=null,curArtifac
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function hash(s){let h=5381;for(let i=0;i<s.length;i++)h=((h<<5)+h+s.charCodeAt(i))>>>0;return h.toString(36);}
+// ★ يستخرج قسم الخطة/التفكير الذي يكتبه النموذج داخل <plan>...</plan> (بناءً
+// على تعليمة النظام المُضافة في apiMessages) ليُعرض في صندوق التفكير في
+// agent-box بدل ظهوره كنص عادي داخل فقاعة الدردشة المرئية.
+function extractPlan(content){
+  const m=content.match(/<plan>([\s\S]*?)<\/plan>/i);
+  if(!m)return{plan:'',rest:content};
+  return{plan:m[1].trim(),rest:(content.slice(0,m.index)+content.slice(m.index+m[0].length)).trim()};
+}
 function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;$('toasts').appendChild(d);setTimeout(()=>d.remove(),2800);}
 function cur(){return sessions.find(s=>s.id===curId);}
 function slimSessions(){
@@ -951,6 +959,24 @@ function setView(v){codePanel.dataset.view=v;document.querySelectorAll('.cp-tabs
 function closePanel(){codePanel.classList.remove('open','full');liveEnd();}
 function dlArtifact(){if(!curArtifact)return;
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([curArtifact.content]));a.download=curArtifact.title;a.click();toast('⬇ تم التنزيل');}
+// ★ يعرض أي ملف تُرجعه نتيجة أداة (file_url من create_docx/create_pdf/
+// create_xlsx/fetch_media_to_file...) كبطاقة تحميل مرئية في الدردشة، بدل أن
+// يبقى مدفوناً كنص JSON خام لا يراه المستخدم إلا إذا قرأه النموذج له يدوياً.
+function addFileArtifactIfAny(resultContent,toolName){
+  let parsed;try{parsed=JSON.parse(resultContent);}catch(e){return;}
+  const r=parsed?.result||parsed;
+  const fileUrl=r?.file_url;
+  if(!fileUrl||typeof fileUrl!=='string')return;
+  const name=fileUrl.split('/').pop();
+  const full=fileUrl.startsWith('http')?fileUrl:Backend.url()+fileUrl;
+  const w=$('chatInner');
+  const d=document.createElement('div');d.className='msg bot';
+  d.innerHTML=`<a href="${full}" target="_blank" class="artifact" style="text-decoration:none">
+    <span class="aic">📁</span>
+    <span class="at"><b>${esc(name)}</b><small>${esc(toolName)} · اضغط لفتح/تحميل الملف</small></span>
+  </a>`;
+  w.appendChild(d);scrollBottom(true);
+}
 
 /* ============ 13) الملفات + القوائم ============ */
 async function uploadMediaFile(file){
@@ -1021,9 +1047,17 @@ function genParams(){const o={};
   if(cfg.temp!=='')o.temperature=parseFloat(cfg.temp);
   if(cfg.maxTok!=='')o.max_tokens=parseInt(cfg.maxTok);
   if(cfg.topP!=='')o.top_p=parseFloat(cfg.topP);return o;}
+const STANDING_INSTRUCTIONS=
+`عند إنشاء كود طويل أو منطقي متعدد الخطوات: اكتب أولاً خطة موجزة ومرقّمة داخل
+الوسم <plan> بالضبط هكذا: <plan>١. ... ٢. ... </plan> (هذا القسم لا يظهر في
+الدردشة المرئية للمستخدم، بل في صندوق تفكير منفصل)، ثم تابع مباشرة بعده
+بكتابة الكود الفعلي كاملاً في كتلة كود واحدة متماسكة تحقق كل بنود الخطة.
+إن وُجدت "ذاكرة طويلة المدى مسترجعة" في تعليمات النظام، اعتمد عليها فعلياً
+للحفاظ على الاتساق مع القرارات والتفضيلات السابقة للمستخدم عبر المحادثات،
+واذكر في الخطة أي قرار سابق تعتمد عليه.`;
 function apiMessages(s,zepCtx){
   const m=s.messages.map(({_files,...x})=>({...x,content:x.content??''}));
-  const sys=[cfg.sysPrompt,zepCtx].filter(Boolean).join('\n\n');
+  const sys=[cfg.sysPrompt,STANDING_INSTRUCTIONS,zepCtx].filter(Boolean).join('\n\n');
   return sys?[{role:'system',content:sys},...m]:m;}
 function setBusy(v){busy=v;$('send').style.display=v?'none':'block';$('stopBtn').style.display=v?'block':'none';
   if(!v)$('chatFollowBtn').style.display='none';}
@@ -1116,6 +1150,7 @@ async function agentLoop(s,box,zepCtx){
               const out=await Backend.execute(tc.function.name,args);
               resultContent=String(out);
               st.remove();box.step('✓','ok','نتيجة '+tc.function.name,resultContent);
+              addFileArtifactIfAny(resultContent,tc.function.name);
             }catch(e){
               resultContent=JSON.stringify({error:'execution_failed',message:e.message});
               st.remove();box.step('✗','bad','فشل '+tc.function.name+': '+e.message);
@@ -1160,6 +1195,11 @@ async function requestModel(s,box,zepCtx,useTools){
   if(!out.content&&!out.tool_calls?.length){
     box.step('↺','run','لم يصل محتوى قابل للقراءة من البث — إعادة المحاولة بدون بث');
     try{out=await nonStreamChat({...body,stream:false});}catch(e2){box.step('✗','bad','فشلت إعادة المحاولة أيضاً: '+e2.message);}
+  }
+  // في حال لم يُستخرج القسم بعد (مثلاً جاء الرد من nonStreamChat مباشرة)
+  if(out.content){
+    const{plan,rest}=extractPlan(out.content);
+    if(plan){box.step('🗺️','ok','خطة النموذج (اضغط للعرض)',plan);out={...out,content:rest};}
   }
   return out;
 }
@@ -1260,6 +1300,10 @@ async function streamChat(body,box){
     err:(!full&&!tcAcc.length)?'لم يُستخرج أي محتوى من البث':'',
     body:(handledAsWholeJson?'[تم تفسيره كـ JSON كامل غير متدفق] ':'')+rawAll.slice(0,400)});
   if(DIAG.length>60)DIAG.pop();
+  {
+    const{plan,rest}=extractPlan(full);
+    if(plan){box.step('🗺️','ok','خطة النموذج (اضغط للعرض)',plan);full=rest;}
+  }
   if(div){
     const sess=cur();
     div.innerHTML=md(full,sess);
